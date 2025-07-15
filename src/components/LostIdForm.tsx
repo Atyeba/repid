@@ -1,17 +1,21 @@
 import React, { useRef, useEffect, useState } from 'react';
-import * as faceapi from 'face-api.js';
-import styles from './LoginForm.module.css'; 
-import '@fortawesome/fontawesome-free/css/all.min.css';
+import { checkIdExists } from '../utils/api';
+import { User, IdCard, CalendarDays, Camera, AlignLeft } from 'lucide-react';
 
-
-
-
+import {
+  doc,
+  setDoc,
+  collection,
+  query,
+  where,
+  getDocs,
+  addDoc, 
+} from 'firebase/firestore';
+import { db } from '../utils/db';
 
 export default function LostIdForm() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [showCameraModal, setShowCameraModal] = useState(false);
   const [selfie, setSelfie] = useState<string | null>(null);
   const [message, setMessage] = useState('');
@@ -26,24 +30,6 @@ export default function LostIdForm() {
     selfieBase64: '',
   });
 
-
-
-
-
-
-  useEffect(() => {
-    const loadModels = async () => {
-      setMessage('Loading face detection models...');
-      await Promise.all([
-        faceapi.nets.tinyFaceDetector.loadFromUri('/models'),
-        faceapi.nets.faceLandmark68Net.loadFromUri('/models'),
-      ]);
-      setModelsLoaded(true);
-      setMessage('');
-    };
-    loadModels();
-  }, []);
-
   useEffect(() => {
     if (!showCameraModal) return;
 
@@ -53,66 +39,10 @@ export default function LostIdForm() {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           await videoRef.current.play();
-          setMessage('');
-          runDetectionLoop();
         }
       } catch {
         setMessage('Error accessing camera');
       }
-    };
-
-
-
-
-
-    
-    const runDetectionLoop = async () => {
-      if (!videoRef.current || !canvasRef.current) return;
-
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      const displaySize = { width: video.videoWidth, height: video.videoHeight };
-
-      canvas.width = displaySize.width;
-      canvas.height = displaySize.height;
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      const detect = async () => {
-        if (!showCameraModal || capturing) return;
-
-        const detection = await faceapi
-          .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
-          .withFaceLandmarks();
-
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-        if (detection) {
-          const resizedDetections = faceapi.resizeResults(detection, displaySize);
-          faceapi.draw.drawDetections(canvas, resizedDetections);
-          faceapi.draw.drawFaceLandmarks(canvas, resizedDetections);
-
-          const brightness = calculateBrightness(canvas);
-
-          if (brightness > 3) {
-            setMessage('Face detected and clear. Capturing...');
-            setCapturing(true);
-            setTimeout(() => {
-              captureSelfie();
-            }, 1000);
-            return;
-          } else {
-            setMessage('Face detected but lighting too low.');
-          }
-        } else {
-          setMessage('No face detected. Please show your face clearly.');
-        }
-
-        requestAnimationFrame(detect);
-      };
-
-      detect();
     };
 
     startCamera();
@@ -122,49 +52,22 @@ export default function LostIdForm() {
         const stream = videoRef.current.srcObject as MediaStream;
         stream.getTracks().forEach(track => track.stop());
       }
-      setCapturing(false);
-      setMessage('');
     };
-  }, [showCameraModal, capturing]);
-
-  const calculateBrightness = (canvas: HTMLCanvasElement) => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return 0;
-    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const data = imgData.data;
-    let sum = 0;
-    for (let i = 0; i < data.length; i += 4) {
-      sum += 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
-    }
-    return sum / (data.length / 4);
-  };
+  }, [showCameraModal]);
 
   const captureSelfie = () => {
     if (!videoRef.current) return;
-
     const canvas = document.createElement('canvas');
     canvas.width = videoRef.current.videoWidth;
     canvas.height = videoRef.current.videoHeight;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-
     ctx.drawImage(videoRef.current, 0, 0);
     const dataUrl = canvas.toDataURL('image/jpeg');
     setSelfie(dataUrl);
     setFormData(prev => ({ ...prev, selfieBase64: dataUrl }));
-
     setShowCameraModal(false);
-    setCapturing(false);
-    setMessage('');
   };
-
-
-
-
-
-
-
-
 
   const isValidSouthAfricanID = (id: string) => /^\d{13}$/.test(id);
 
@@ -176,84 +79,277 @@ export default function LostIdForm() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setMessage('');
+
     if (!formData.selfieBase64) {
-      setMessage('Please capture your selfie before submitting.');
+      setMessage('Please capture your selfie.');
       return;
     }
     if (!isValidSouthAfricanID(formData.idNumber)) {
-      setMessage('Invalid South African ID number. Must be exactly 13 digits.');
+      setMessage('ID must be 13 digits.');
       return;
     }
-    alert('Form submitted! (Add your API call here)');
-    setMessage('');
+
+    setMessage('Verifying ID existence...');
+    const existsInAPI = await checkIdExists(formData.idNumber);
+    if (!existsInAPI) {
+      setMessage('User does not exist.');
+      return;
+    }
+
+    try {
+      const lostIDsRef = collection(db, 'lostIDs');
+      const q = query(lostIDsRef, where('idNumber', '==', formData.idNumber));
+      const querySnapshot = await getDocs(q);
+
+      if (!querySnapshot.empty) {
+        setMessage('This ID number has already been reported.');
+        return;
+      }
+    } catch (err) {
+      console.error('Error checking ID existence in Firestore:', err);
+      setMessage('Error verifying existing reports.');
+      return;
+    }
+
+    try {
+      setMessage('Submitting report...');
+      const lostIDsRef = collection(db, 'lostIDs');
+      await addDoc(lostIDsRef, {
+        ...formData,
+        createdAt: new Date(),
+      });
+
+      setMessage('Report submitted successfully!');
+      alert('Form submitted!');
+      setFormData({
+        name: '',
+        surname: '',
+        idNumber: '',
+        reason: '',
+        dateLost: '',
+        selfieBase64: '',
+      });
+      setSelfie(null);
+    } catch (error) {
+      console.error('Error submitting report:', error);
+      setMessage('Error submitting report. Try again.');
+    }
   };
 
-
-
-
-
+  const styles = {
+    container: {
+      minHeight: '100vh',
+      backgroundColor: '#0f172a',
+      color: '#fff',
+      fontFamily: 'Inter, sans-serif',
+      display: 'flex',
+      justifyContent: 'center',
+      alignItems: 'center',
+      padding: '40px',
+    },
+    formWrapper: {
+      backgroundColor: '#1e293b',
+      borderRadius: '16px',
+      padding: '40px',
+      width: '100%',
+      maxWidth: '500px',
+      boxShadow: '0 0 30px rgba(0,0,0,0.3)',
+    },
+    title: {
+      textAlign: 'center' as const,
+      marginBottom: '24px',
+      fontSize: '24px',
+      fontWeight: 'bold',
+      color: '#f9fafb',
+    },
+    inputField: {
+      display: 'flex',
+      alignItems: 'center',
+      background: '#0f172a',
+      padding: '12px',
+      borderRadius: '10px',
+      marginBottom: '16px',
+      border: '1px solid #334155',
+      gap: '10px',
+    },
+    input: {
+      flex: 1,
+      background: 'transparent',
+      border: 'none',
+      color: '#fff',
+      outline: 'none',
+      fontSize: '14px',
+    },
+    textarea: {
+      flex: 1,
+      background: 'transparent',
+      border: 'none',
+      color: '#fff',
+      outline: 'none',
+      fontSize: '14px',
+      resize: 'vertical' as const,
+    },
+    button: {
+      width: '100%',
+      padding: '12px',
+      borderRadius: '10px',
+      background: 'linear-gradient(to right, #9333ea, #06b6d4)',
+      border: 'none',
+      color: '#fff',
+      fontWeight: 'bold',
+      fontSize: '15px',
+      cursor: 'pointer',
+      marginTop: '20px',
+    },
+    cameraIcon: {
+      fontSize: '40px',
+      background: 'none',
+      border: 'none',
+      color: '#06b6d4',
+      cursor: 'pointer',
+      margin: '10px auto',
+      display: 'block',
+    },
+    selfiePreview: {
+      width: 150,
+      borderRadius: 8,
+      display: 'block',
+      margin: '10px auto',
+    },
+    modalOverlay: {
+      position: 'fixed' as const,
+      top: 0, left: 0, width: '100vw', height: '100vh',
+      backgroundColor: 'rgba(0,0,0,0.8)',
+      display: 'flex',
+      justifyContent: 'center',
+      alignItems: 'center',
+      zIndex: 9999,
+      flexDirection: 'column' as const,
+    },
+    cameraContainer: {
+      position: 'relative' as const,
+      width: 320,
+      height: 420,
+      borderRadius: '16px',
+      overflow: 'hidden',
+      boxShadow: '0 0 20px #fff',
+      backgroundColor: '#000',
+    },
+    captureBtn: {
+      position: 'absolute' as const,
+      bottom: 10,
+      left: '50%',
+      transform: 'translateX(-50%)',
+      padding: '10px 20px',
+      backgroundColor: '#fff',
+      border: 'none',
+      borderRadius: 6,
+      fontWeight: 'bold',
+      cursor: 'pointer',
+    }
+  };
 
   return (
-    <div className={styles.formsContainer}>
-      <form className={styles.form} onSubmit={handleSubmit}>
-        <h2 className={styles.title}>Report Lost ID</h2>
+    <div style={styles.container}>
+      <form style={styles.formWrapper} onSubmit={handleSubmit}>
+        <h2 style={styles.title}>Report Lost ID</h2>
 
-        <div className={styles.inputField}>
-          <i className="fas fa-user" />
-          <input type="text" name="name" placeholder="First Name" value={formData.name} onChange={handleChange} required disabled={capturing} />
+        <div style={styles.inputField}>
+          <User size={18} color="#cbd5e1" />
+          <input
+            type="text"
+            name="name"
+            placeholder="First Name"
+            style={styles.input}
+            value={formData.name}
+            onChange={handleChange}
+            required
+          />
         </div>
 
-        <div className={styles.inputField}>
-          <i className="fas fa-user" />
-          <input type="text" name="surname" placeholder="Surname" value={formData.surname} onChange={handleChange} required disabled={capturing} />
+        <div style={styles.inputField}>
+          <User size={18} color="#cbd5e1" />
+          <input
+            type="text"
+            name="surname"
+            placeholder="Surname"
+            style={styles.input}
+            value={formData.surname}
+            onChange={handleChange}
+            required
+          />
         </div>
 
-        <div className={styles.inputField}>
-          <i className="fas fa-id-card" />
-          <input type="text" name="idNumber" placeholder="ID Number" value={formData.idNumber} onChange={handleChange} required disabled={capturing} />
+        <div style={styles.inputField}>
+          <IdCard size={18} color="#cbd5e1" />
+          <input
+            type="text"
+            name="idNumber"
+            placeholder="ID Number"
+            style={styles.input}
+            value={formData.idNumber}
+            onChange={handleChange}
+            required
+          />
         </div>
 
-        <div className={styles.inputField}>
-          <i className="fas fa-align-left" />
-          <textarea name="reason" placeholder="Reason for Loss" value={formData.reason} onChange={handleChange} required disabled={capturing} style={{ resize: 'vertical', padding: '10px', borderRadius: '5px' }} />
+        <div style={styles.inputField}>
+          <AlignLeft size={18} color="#cbd5e1" />
+          <textarea
+            name="reason"
+            placeholder="Reason for Loss"
+            style={styles.textarea}
+            rows={3}
+            value={formData.reason}
+            onChange={handleChange}
+            required
+          />
         </div>
 
-        <div className={styles.inputField}>
-          <i className="fas fa-calendar-alt" />
-          <input type="date" name="dateLost" value={formData.dateLost} onChange={handleChange} required disabled={capturing} />
+        <div style={styles.inputField}>
+          <CalendarDays size={18} color="#cbd5e1" />
+          <input
+            type="date"
+            name="dateLost"
+            style={styles.input}
+            value={formData.dateLost}
+            onChange={handleChange}
+            required
+          />
         </div>
 
-
-
-
-
-
-        <div style={{ textAlign: 'center', margin: '20px 0' }}>
-          <button type="button" onClick={() => setShowCameraModal(true)} disabled={!modelsLoaded || capturing} style={{ background: 'none', border: 'none', cursor: 'pointer', outline: 'none' }}>
-            <i className="fas fa-camera" style={{ fontSize: '48px', color: '#333' }} />
-          </button>
-        </div>
+        <button type="button" onClick={() => setShowCameraModal(true)} style={styles.cameraIcon}>
+          <Camera size={36} />
+        </button>
 
         {selfie && (
-          <img src={selfie} alt="Captured selfie" style={{ width: 150, borderRadius: 8, display: 'block', margin: '10px auto' }} />
+          <img src={selfie} alt="Captured selfie" style={styles.selfiePreview} />
         )}
 
-        <input type="submit" value={capturing ? 'Capturing...' : 'Submit Report'} className={`${styles.btn} ${styles.solid}`} disabled={capturing} />
-        {message && <p style={{ textAlign: 'center', marginTop: 16, color: capturing ? 'orange' : '#00c851' }}>{message}</p>}
+        <button type="submit" style={styles.button}>
+          Submit Report
+        </button>
+
+        {message && <p style={{ textAlign: 'center', marginTop: 16, color: 'red' }}>{message}</p>}
       </form>
 
-
-
-
-
       {showCameraModal && (
-        <div onClick={() => !capturing && setShowCameraModal(false)} style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999, flexDirection: 'column' }}>
-          <div onClick={e => e.stopPropagation()} style={{ position: 'relative', width: 320, height: 420, borderRadius: '50% / 70%', overflow: 'hidden', boxShadow: '0 0 20px #fff', backgroundColor: '#000', cursor: capturing ? 'default' : 'pointer' }}>
-            <video ref={videoRef} muted playsInline style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-            <canvas ref={canvasRef} style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }} />
+        <div style={styles.modalOverlay} onClick={() => !capturing && setShowCameraModal(false)}>
+          <div onClick={e => e.stopPropagation()} style={styles.cameraContainer}>
+            <video
+              ref={videoRef}
+              muted
+              playsInline
+              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+              autoPlay
+            />
+            <button onClick={captureSelfie} style={styles.captureBtn}>
+              Capture
+            </button>
           </div>
-          <p style={{ color: 'white', marginTop: 10, fontWeight: 'bold' }}>{message}</p>
-          {!capturing && <small style={{ color: 'white', opacity: 0.7 }}>Click outside camera to cancel</small>}
+          <p style={{ color: 'white', marginTop: 10 }}>{message}</p>
+          <small style={{ color: 'white', opacity: 0.7 }}>Click outside to cancel</small>
         </div>
       )}
     </div>
